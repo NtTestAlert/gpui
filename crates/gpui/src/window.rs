@@ -340,10 +340,6 @@ slotmap::new_key_type! {
 }
 
 thread_local! {
-    /// Fallback arena used when no app-specific arena is active.
-    /// In production, each window draw sets CURRENT_ELEMENT_ARENA to the app's arena.
-    pub(crate) static ELEMENT_ARENA: RefCell<Arena> = RefCell::new(Arena::new(1024 * 1024));
-
     /// Points to the current App's element arena during draw operations.
     /// This allows multiple test Apps to have isolated arenas, preventing
     /// cross-session corruption when the scheduler interleaves their tasks.
@@ -364,10 +360,9 @@ fn draw_in_progress() -> bool {
     CURRENT_ELEMENT_ARENA.with(|current| current.get().is_some())
 }
 
-/// Allocates an element in the current arena. Uses the app-specific arena if one
-/// is active (during draw), otherwise falls back to the thread-local ELEMENT_ARENA.
+/// Supplies the active draw's arena, if a draw is in progress.
 #[inline(always)]
-pub(crate) fn with_element_arena<R>(callback: impl FnOnce(&mut Arena) -> R) -> R {
+pub(crate) fn with_element_arena<R>(callback: impl FnOnce(Option<&mut Arena>) -> R) -> R {
     let mut callback = Some(callback);
     let mut result = None;
     let access = with_element_arena_erased(&mut |arena| {
@@ -7857,16 +7852,18 @@ pub fn outline(
 }
 
 #[inline(never)]
-fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(), AccessError> {
+fn with_element_arena_erased(
+    callback: &mut dyn FnMut(Option<&mut Arena>),
+) -> Result<(), AccessError> {
     if let Some(arena_pointer) = CURRENT_ELEMENT_ARENA.try_with(Cell::get)? {
         // SAFETY: The pointer is valid for the duration of the draw operation
         // that set it, and we're being called during that same draw.
         let arena_cell = unsafe { &*arena_pointer };
-        callback(&mut arena_cell.borrow_mut());
-        Ok(())
+        callback(Some(&mut arena_cell.borrow_mut()));
     } else {
-        ELEMENT_ARENA.try_with(|arena| callback(&mut arena.borrow_mut()))
+        callback(None);
     }
+    Ok(())
 }
 
 #[cfg(test)]
