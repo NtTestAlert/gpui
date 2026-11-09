@@ -1,3 +1,4 @@
+// Locally modified to cache the DirectWrite faces used by shaped fallback glyphs.
 use std::{borrow::Cow, sync::Arc};
 
 use ::util::ResultExt;
@@ -67,6 +68,7 @@ struct FontIdentifier {
     postscript_name: String,
     weight: i32,
     style: i32,
+    simulations: i32,
 }
 
 impl DirectWriteComponent {
@@ -455,6 +457,30 @@ impl DirectWriteState {
         } {
             self.system_font_collection = collection.unwrap();
         }
+    }
+
+    /// Fallback glyph indices belong to the face DirectWrite passed to the renderer. Looking
+    /// it up again by family can select a different face (for example, a simulated italic).
+    fn shaped_font_id(&mut self, face: &IDWriteFontFace3, locale: &str) -> Option<FontId> {
+        let identifier = get_font_identifier(face, locale)?;
+        if let Some(&id) = self.font_id_by_identifier.get(&identifier) {
+            return Some(id);
+        }
+
+        let family = get_name(unsafe { face.GetFamilyNames().log_err()? }, locale).log_err()?;
+        let features = unsafe { self.components.factory.CreateTypography().log_err()? };
+        let is_system_font =
+            unsafe { self.custom_font_collection.GetFontFromFontFace(face) }.is_err();
+        let id = FontId(self.fonts.len());
+        self.fonts.push(FontInfo {
+            font_family: family,
+            font_face: face.clone(),
+            features,
+            fallbacks: None,
+            is_system_font,
+        });
+        self.font_id_by_identifier.insert(identifier, id);
+        Some(id)
     }
 
     fn select_font(&mut self, target_font: &Font) -> FontId {
@@ -1467,25 +1493,17 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         // This `cast()` action here should never fail since we are running on Win10+, and
         // `IDWriteFontFace3` requires Win10
         let font_face = &font_face.cast::<IDWriteFontFace3>().unwrap();
-        let Some((font_identifier, font_struct, color_font)) =
-            get_font_identifier_and_font_struct(font_face, &self.locale)
-        else {
-            return Ok(());
-        };
-
-        let font_id = if let Some(id) = context
-            .text_system
-            .font_id_by_identifier
-            .get(&font_identifier)
-        {
-            *id
-        } else {
-            context.text_system.select_font(&font_struct)
-        };
-
-        let glyph_ids = unsafe { std::slice::from_raw_parts(glyphrun.glyphIndices, glyph_count) };
         let glyph_advances =
             unsafe { std::slice::from_raw_parts(glyphrun.glyphAdvances, glyph_count) };
+        let Some(font_id) = context.text_system.shaped_font_id(font_face, &self.locale) else {
+            // An unidentifiable face cannot be rasterized, but subsequent runs still start
+            // after the advances DirectWrite gave this one.
+            context.width += glyph_advances.iter().sum::<f32>();
+            return Ok(());
+        };
+        let color_font = unsafe { font_face.IsColorFont().as_bool() };
+
+        let glyph_ids = unsafe { std::slice::from_raw_parts(glyphrun.glyphIndices, glyph_count) };
         let glyph_offsets =
             unsafe { std::slice::from_raw_parts(glyphrun.glyphOffsets, glyph_count) };
         let cluster_map =
@@ -1665,31 +1683,6 @@ fn get_font_names_from_collection(
     }
 }
 
-fn get_font_identifier_and_font_struct(
-    font_face: &IDWriteFontFace3,
-    locale: &str,
-) -> Option<(FontIdentifier, Font, bool)> {
-    let postscript_name = get_postscript_name(font_face, locale).log_err()?;
-    let localized_family_name = unsafe { font_face.GetFamilyNames().log_err() }?;
-    let family_name = get_name(localized_family_name, locale).log_err()?;
-    let weight = unsafe { font_face.GetWeight() };
-    let style = unsafe { font_face.GetStyle() };
-    let identifier = FontIdentifier {
-        postscript_name,
-        weight: weight.0,
-        style: style.0,
-    };
-    let font_struct = Font {
-        family: family_name.into(),
-        features: FontFeatures::default(),
-        weight: weight.into(),
-        style: style.into(),
-        fallbacks: None,
-    };
-    let is_emoji = unsafe { font_face.IsColorFont().as_bool() };
-    Some((identifier, font_struct, is_emoji))
-}
-
 #[inline]
 fn get_font_identifier(font_face: &IDWriteFontFace3, locale: &str) -> Option<FontIdentifier> {
     let weight = unsafe { font_face.GetWeight().0 };
@@ -1700,6 +1693,7 @@ fn get_font_identifier(font_face: &IDWriteFontFace3, locale: &str) -> Option<Fon
             postscript_name,
             weight,
             style,
+            simulations: unsafe { font_face.GetSimulations().0 },
         })
 }
 

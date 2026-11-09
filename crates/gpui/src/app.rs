@@ -1,3 +1,4 @@
+// Locally modified to retire render dependency metadata when entities and windows disappear.
 use std::{
     any::{TypeId, type_name},
     cell::{BorrowMutError, Ref, RefCell, RefMut},
@@ -813,12 +814,8 @@ impl App {
     ) {
         let mut tracked_entities =
             std::mem::take(self.tracked_entities.entry(window_handle.id).or_default());
-        for entity in tracked_entities.iter() {
-            self.window_invalidators_by_entity
-                .entry(*entity)
-                .and_modify(|windows| {
-                    windows.remove(&window_handle.id);
-                });
+        for &entity in tracked_entities.difference(entities) {
+            self.detach_window_invalidator(entity, window_handle.id);
         }
         for entity in entities.iter() {
             self.window_invalidators_by_entity
@@ -830,6 +827,21 @@ impl App {
         tracked_entities.extend(entities.iter().copied());
         self.tracked_entities
             .insert(window_handle.id, tracked_entities);
+    }
+
+    fn detach_window_invalidator(&mut self, entity: EntityId, window: WindowId) {
+        if let Some(windows) = self.window_invalidators_by_entity.get_mut(&entity) {
+            windows.remove(&window);
+            if windows.is_empty() {
+                self.window_invalidators_by_entity.remove(&entity);
+            }
+        }
+    }
+
+    /// Number of entities with a recorded window render dependency.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn tracked_render_entity_count(&self) -> usize {
+        self.window_invalidators_by_entity.len()
     }
 
     pub(crate) fn new_observer(&mut self, key: EntityId, value: Handler) -> Subscription {
@@ -1266,6 +1278,7 @@ impl App {
             }
 
             for (entity_id, mut entity) in dropped {
+                self.window_invalidators_by_entity.remove(&entity_id);
                 self.observers.remove(&entity_id);
                 self.event_listeners.remove(&entity_id);
                 for release_callback in self.release_listeners.remove(&entity_id) {
@@ -1374,6 +1387,11 @@ impl App {
             if window.removed {
                 cx.window_handles.remove(&id);
                 cx.windows.remove(id);
+                if let Some(entities) = cx.tracked_entities.remove(&id) {
+                    for entity in entities {
+                        cx.detach_window_invalidator(entity, id);
+                    }
+                }
 
                 cx.window_closed_observers.clone().retain(&(), |callback| {
                     callback(cx);
@@ -2032,25 +2050,17 @@ impl App {
 
     /// Tell GPUI that an entity has changed and observers of it should be notified.
     pub fn notify(&mut self, entity_id: EntityId) {
-        let window_invalidators = mem::take(
-            self.window_invalidators_by_entity
-                .entry(entity_id)
-                .or_default(),
-        );
-
-        if window_invalidators.is_empty() {
-            if self.pending_notifications.insert(entity_id) {
-                self.pending_effects
-                    .push_back(Effect::Notify { emitter: entity_id });
-            }
-        } else {
+        if let Some(window_invalidators) = self.window_invalidators_by_entity.get_mut(&entity_id) {
+            let window_invalidators = mem::take(window_invalidators);
             for invalidator in window_invalidators.values() {
                 invalidator.invalidate_view(entity_id, self);
             }
+            self.window_invalidators_by_entity
+                .insert(entity_id, window_invalidators);
+        } else if self.pending_notifications.insert(entity_id) {
+            self.pending_effects
+                .push_back(Effect::Notify { emitter: entity_id });
         }
-
-        self.window_invalidators_by_entity
-            .insert(entity_id, window_invalidators);
     }
 
     /// Returns the name for this [`App`].
