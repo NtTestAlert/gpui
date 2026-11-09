@@ -76,6 +76,8 @@ struct DirectWriteState {
     fonts: Vec<FontInfo>,
     font_to_font_id: HashMap<Font, FontId>,
     font_info_cache: HashMap<usize, FontId>,
+    #[cfg(test)]
+    shaped_face_cache_misses: usize,
     layout_line_scratch: Vec<u16>,
 }
 
@@ -213,6 +215,8 @@ impl DirectWriteTextSystem {
                 fonts: Vec::new(),
                 font_to_font_id: HashMap::default(),
                 font_info_cache: HashMap::default(),
+                #[cfg(test)]
+                shaped_face_cache_misses: 0,
                 layout_line_scratch: Vec::new(),
             }),
         })
@@ -301,6 +305,105 @@ impl PlatformTextSystem for DirectWriteTextSystem {
 }
 
 impl DirectWriteState {
+    fn shaped_font_id(
+        &mut self,
+        components: &DirectWriteComponents,
+        face: &IDWriteFontFace3,
+        locale: &HSTRING,
+    ) -> windows::core::Result<FontId> {
+        let key = face.cast::<IUnknown>()?.as_raw().addr();
+        if let Some(&id) = self.font_info_cache.get(&key) {
+            return Ok(id);
+        }
+        #[cfg(test)]
+        {
+            self.shaped_face_cache_misses += 1;
+        }
+        // Distinct COM objects can refer to the same physical face. Reuse the existing
+        // rasterization ID without caching an address whose owner we won't retain.
+        if let Some(id) = self.equivalent_face_id(&components.factory, face) {
+            return Ok(id);
+        }
+
+        // Glyph indices refer to the supplied face, including any simulated style.
+        // Keeping the face alive also keeps this COM identity valid in the cache.
+        let family = get_name(unsafe { face.GetFamilyNames()? }, locale)
+            .map_err(|_| Error::new(DWRITE_E_NOFONT, "Missing font family name"))?;
+        let collection = if unsafe { self.custom_font_collection.GetFontFromFontFace(face) }.is_ok()
+        {
+            &self.custom_font_collection
+        } else {
+            &self.system_font_collection
+        };
+        let info = FontInfo {
+            font_family_h: HSTRING::from(family.as_str()),
+            font_face: face.clone(),
+            features: unsafe { components.factory.CreateTypography()? },
+            fallbacks: None,
+            font_collection: collection.clone(),
+        };
+        let id = FontId(self.fonts.len());
+        self.fonts.push(info);
+        self.font_info_cache.insert(key, id);
+        Ok(id)
+    }
+
+    fn equivalent_face_id(
+        &self,
+        factory: &IDWriteFactory5,
+        face: &IDWriteFontFace3,
+    ) -> Option<FontId> {
+        let Ok(face) = face.cast::<IDWriteFontFace5>() else {
+            return self.equivalent_legacy_face_id(factory, face);
+        };
+        let simulations = unsafe { face.GetSimulations() };
+        let axes = font_axis_values(&face).ok()?;
+        // The registry is in allocation order. Keep the oldest rasterization ID even
+        // when several requests with different shaping features already use this face.
+        self.fonts
+            .iter()
+            .position(|font| {
+                let candidate = &font.font_face;
+                if unsafe {
+                    candidate.GetSimulations() != simulations || !face.Equals(candidate).as_bool()
+                } {
+                    return false;
+                }
+                candidate
+                    .cast::<IDWriteFontFace5>()
+                    .and_then(|candidate| font_axis_values(&candidate))
+                    .is_ok_and(|other_axes| other_axes == axes)
+            })
+            .map(FontId)
+    }
+
+    fn equivalent_legacy_face_id(
+        &self,
+        factory: &IDWriteFactory5,
+        face: &IDWriteFontFace3,
+    ) -> Option<FontId> {
+        // Windows 10 1703 predates IDWriteFontFace5 and variable-axis comparison.
+        // Its file/index/simulation references compare across origins when created by one factory.
+        let in_factory = |face: &IDWriteFontFace3| unsafe {
+            let reference = face.GetFontFaceReference()?;
+            factory.CreateFontFaceReference(
+                &reference.GetFontFile()?,
+                reference.GetFontFaceIndex(),
+                reference.GetSimulations(),
+            )
+        };
+        let reference = in_factory(face).ok()?;
+        let simulations = unsafe { face.GetSimulations() };
+        self.fonts
+            .iter()
+            .position(|font| {
+                (unsafe { font.font_face.GetSimulations() }) == simulations
+                    && in_factory(&font.font_face)
+                        .is_ok_and(|candidate| unsafe { reference.Equals(&candidate).as_bool() })
+            })
+            .map(FontId)
+    }
+
     fn select_and_cache_font(
         &mut self,
         components: &DirectWriteComponents,
@@ -321,8 +424,16 @@ impl DirectWriteState {
 
             let font_id = FontId(this.fonts.len());
             let font_face_key = info.font_face.cast::<IUnknown>().unwrap().as_raw().addr();
+            let raster_id = this
+                .font_info_cache
+                .get(&font_face_key)
+                .copied()
+                .or_else(|| this.equivalent_face_id(&components.factory, &info.font_face))
+                .unwrap_or(font_id);
             this.fonts.push(info);
-            this.font_info_cache.insert(font_face_key, font_id);
+            // Feature and fallback settings can produce distinct request IDs for one face.
+            // Keep its first rasterization ID stable across subsequent explicit requests.
+            this.font_info_cache.insert(font_face_key, raster_id);
             Some(font_id)
         };
 
@@ -1519,33 +1630,10 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             ));
         };
 
-        let font_face_key = font_face.cast::<IUnknown>().unwrap().as_raw().addr();
-        let font_id = context
-            .text_system
-            .font_info_cache
-            .get(&font_face_key)
-            .copied()
-            // in some circumstances, we might be getting served a FontFace that we did not create ourselves
-            // so create a new font from it and cache it accordingly. The usual culprit here seems to be Segoe UI Symbol
-            .map_or_else(
-                || {
-                    let font = font_face_to_font(font_face, &self.locale)
-                        .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?;
-                    let font_id = match context.text_system.font_to_font_id.get(&font) {
-                        Some(&font_id) => font_id,
-                        None => context
-                            .text_system
-                            .select_and_cache_font(context.components, &font)
-                            .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?,
-                    };
-                    context
-                        .text_system
-                        .font_info_cache
-                        .insert(font_face_key, font_id);
-                    windows::core::Result::Ok(font_id)
-                },
-                Ok,
-            )?;
+        let font_id =
+            context
+                .text_system
+                .shaped_font_id(context.components, font_face, &self.locale)?;
 
         let color_font = unsafe { font_face.IsColorFont().as_bool() };
 
@@ -1718,6 +1806,16 @@ impl<'a> StringIndexConverter<'a> {
     }
 }
 
+fn font_axis_values(face: &IDWriteFontFace5) -> windows::core::Result<Vec<DWRITE_FONT_AXIS_VALUE>> {
+    let count = unsafe { face.GetFontAxisValueCount() } as usize;
+    let mut values = vec![DWRITE_FONT_AXIS_VALUE::default(); count];
+    if count > 0 {
+        unsafe { face.GetFontAxisValues(&mut values)? };
+        values.sort_unstable_by_key(|axis| axis.axisTag.0);
+    }
+    Ok(values)
+}
+
 fn font_style_to_dwrite(style: FontStyle) -> DWRITE_FONT_STYLE {
     match style {
         FontStyle::Normal => DWRITE_FONT_STYLE_NORMAL,
@@ -1726,21 +1824,8 @@ fn font_style_to_dwrite(style: FontStyle) -> DWRITE_FONT_STYLE {
     }
 }
 
-fn font_style_from_dwrite(value: DWRITE_FONT_STYLE) -> FontStyle {
-    match value.0 {
-        0 => FontStyle::Normal,
-        1 => FontStyle::Italic,
-        2 => FontStyle::Oblique,
-        _ => unreachable!(),
-    }
-}
-
 fn font_weight_to_dwrite(weight: FontWeight) -> DWRITE_FONT_WEIGHT {
     DWRITE_FONT_WEIGHT(weight.0 as i32)
-}
-
-fn font_weight_from_dwrite(value: DWRITE_FONT_WEIGHT) -> FontWeight {
-    FontWeight(value.0 as f32)
 }
 
 fn get_font_names_from_collection(
@@ -1765,20 +1850,6 @@ fn get_font_names_from_collection(
 
         result
     }
-}
-
-fn font_face_to_font(font_face: &IDWriteFontFace3, locale: &HSTRING) -> Option<Font> {
-    let localized_family_name = unsafe { font_face.GetFamilyNames().log_err() }?;
-    let family_name = get_name(localized_family_name, locale).log_err()?;
-    let weight = unsafe { font_face.GetWeight() };
-    let style = unsafe { font_face.GetStyle() };
-    Some(Font {
-        family: family_name.into(),
-        features: FontFeatures::default(),
-        weight: font_weight_from_dwrite(weight),
-        style: font_style_from_dwrite(style),
-        fallbacks: None,
-    })
 }
 
 // https://learn.microsoft.com/en-us/windows/win32/api/dwrite/ne-dwrite-dwrite_font_feature_tag
@@ -2000,6 +2071,262 @@ mod tests {
         assert_eq!(next, Some((5, 1)));
         let next = analyzer.next();
         assert_eq!(next, None);
+    }
+
+    #[test]
+    fn repeated_layout_reuses_mixed_script_fallback_faces() -> Result<()> {
+        use gpui::{FontFeatures, FontRun, FontStyle};
+
+        let system = DirectWriteTextSystem::new(&DirectXDevices::new()?)?;
+        let mut font = gpui::font("Consolas");
+        font.style = FontStyle::Italic;
+        let base = system.font_id(&font)?;
+        let text = "Latin א ↗ ┃ 😀 العربية नमस्ते 한글";
+        let shape_ids = |font_id| {
+            system
+                .layout_line(
+                    text,
+                    px(14.),
+                    &[FontRun {
+                        len: text.len(),
+                        font_id,
+                    }],
+                )
+                .runs
+                .into_iter()
+                .map(|run| run.font_id)
+                .collect::<Vec<_>>()
+        };
+        let expected = shape_ids(base);
+        assert!(expected.contains(&base));
+        assert!(expected.iter().any(|&id| id != base));
+        let warm_count = system.state.read().fonts.len();
+        let warm_misses = system.state.read().shaped_face_cache_misses;
+        let uses_simulated_fallback = expected.iter().any(|&id| {
+            id != base
+                && unsafe { system.state.read().fonts[id.0].font_face.GetSimulations() }.contains(
+                    windows::Win32::Graphics::DirectWrite::DWRITE_FONT_SIMULATIONS_OBLIQUE,
+                )
+        });
+        assert!(
+            uses_simulated_fallback,
+            "expected a simulated italic fallback"
+        );
+        for _ in 0..128 {
+            assert_eq!(shape_ids(base), expected);
+            assert_eq!(system.state.read().fonts.len(), warm_count);
+        }
+        assert_eq!(system.state.read().shaped_face_cache_misses, warm_misses);
+
+        font.features = FontFeatures::disable_ligatures();
+        let alternate = system.font_id(&font)?;
+        assert_ne!(alternate, base);
+        assert_eq!(shape_ids(alternate), expected);
+        assert_eq!(shape_ids(base), expected);
+        assert_eq!(system.state.read().fonts.len(), warm_count + 1);
+        assert_eq!(system.state.read().shaped_face_cache_misses, warm_misses);
+        Ok(())
+    }
+
+    #[test]
+    fn shaped_run_keeps_simulated_face() -> Result<()> {
+        use super::{RendererContext, StringIndexConverter};
+        use std::mem::ManuallyDrop;
+        use windows::Win32::Graphics::DirectWrite::*;
+        use windows::core::{IUnknown, Interface, w};
+
+        let system = DirectWriteTextSystem::new(&DirectXDevices::new()?)?;
+        let base_id = system.font_id(&gpui::font("Arial"))?;
+        let mut state = system.state.write();
+        let base = &state.fonts[base_id.0].font_face;
+        let simulated = unsafe {
+            base.GetFontFaceReference()?
+                .CreateFontFaceWithSimulations(DWRITE_FONT_SIMULATIONS_OBLIQUE)?
+        };
+        assert_eq!(
+            unsafe { simulated.GetSimulations() },
+            DWRITE_FONT_SIMULATIONS_OBLIQUE
+        );
+        let mut glyph_id = 0;
+        unsafe { simulated.GetGlyphIndices(&u32::from('A'), 1, &mut glyph_id)? };
+        assert_ne!(glyph_id, 0);
+
+        let face: &IDWriteFontFace = &simulated;
+        let run = DWRITE_GLYPH_RUN {
+            // DirectWrite borrows the face for this call. The simulated face owns the reference.
+            fontFace: ManuallyDrop::new(Some(unsafe { std::ptr::read(face) })),
+            fontEmSize: 14.0,
+            glyphCount: 1,
+            glyphIndices: &glyph_id,
+            glyphAdvances: &8.0,
+            glyphOffsets: &DWRITE_GLYPH_OFFSET::default(),
+            ..Default::default()
+        };
+        let description = DWRITE_GLYPH_RUN_DESCRIPTION {
+            string: w!("A"),
+            stringLength: 1,
+            clusterMap: &0,
+            ..Default::default()
+        };
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let mut context = RendererContext {
+                text_system: &mut state,
+                components: &system.components,
+                index_converter: StringIndexConverter::new("A"),
+                runs: &mut runs,
+                width: 0.0,
+            };
+            unsafe {
+                system.components.text_renderer.0.DrawGlyphRun(
+                    Some((&raw mut context).cast()),
+                    0.0,
+                    0.0,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                    &run,
+                    &description,
+                    None,
+                )?;
+            }
+        }
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].font_id, runs[1].font_id);
+        assert_ne!(runs[0].font_id, base_id);
+        let cached = &state.fonts[runs[0].font_id.0].font_face;
+        assert_eq!(
+            unsafe { cached.GetSimulations() },
+            DWRITE_FONT_SIMULATIONS_OBLIQUE,
+            "shaping's simulated oblique must reach the glyph rasterizer"
+        );
+        assert_eq!(
+            cached.cast::<IUnknown>()?,
+            simulated.cast::<IUnknown>()?,
+            "shaped glyph indices must be rasterized with the DirectWrite run's face"
+        );
+        let warm_misses = state.shaped_face_cache_misses;
+        for _ in 0..128 {
+            assert_eq!(
+                state.shaped_font_id(&system.components, &simulated, &system.components.locale)?,
+                runs[0].font_id
+            );
+        }
+        assert_eq!(state.shaped_face_cache_misses, warm_misses);
+        let factory: IDWriteFactory3 =
+            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED)? };
+        let reference = unsafe { simulated.GetFontFaceReference()? };
+        let alternate = unsafe {
+            factory
+                .CreateFontFaceReference(
+                    &reference.GetFontFile()?,
+                    reference.GetFontFaceIndex(),
+                    reference.GetSimulations(),
+                )?
+                .CreateFontFace()?
+        };
+        assert_ne!(simulated.cast::<IUnknown>()?, alternate.cast::<IUnknown>()?);
+        let mut other_request = gpui::font("Arial");
+        other_request.features = gpui::FontFeatures::disable_ligatures();
+        let other_id = state
+            .select_and_cache_font(&system.components, &other_request)
+            .unwrap();
+        assert_ne!(other_id, base_id);
+        let alternate_regular = unsafe {
+            alternate
+                .GetFontFaceReference()?
+                .CreateFontFaceWithSimulations(DWRITE_FONT_SIMULATIONS_NONE)?
+        };
+        assert_eq!(
+            state.shaped_font_id(
+                &system.components,
+                &alternate_regular,
+                &system.components.locale
+            )?,
+            base_id,
+            "the oldest equivalent rasterization ID should win"
+        );
+        assert_eq!(
+            state.equivalent_legacy_face_id(&system.components.factory, &alternate),
+            Some(runs[0].font_id)
+        );
+        assert_eq!(
+            state.equivalent_legacy_face_id(&system.components.factory, &alternate_regular),
+            Some(base_id)
+        );
+        let old_count = state.fonts.len();
+        let old_cache_len = state.font_info_cache.len();
+        assert_eq!(
+            state.shaped_font_id(&system.components, &alternate, &system.components.locale)?,
+            runs[0].font_id
+        );
+        assert_eq!(state.fonts.len(), old_count);
+        assert_eq!(state.font_info_cache.len(), old_cache_len);
+        Ok(())
+    }
+
+    #[test]
+    fn simulated_and_variable_weight_instances_keep_distinct_ids() -> Result<()> {
+        use windows::Win32::Graphics::DirectWrite::*;
+        use windows::core::Interface;
+
+        let system = DirectWriteTextSystem::new(&DirectXDevices::new()?)?;
+        if system.components.factory.cast::<IDWriteFactory6>().is_err() {
+            return Ok(()); // This fixture uses Factory6 to recreate a variable instance.
+        }
+        let family = system.font_id(&gpui::font("Bahnschrift"))?;
+        let mut state = system.state.write();
+        let face = state.fonts[family.0].font_face.cast::<IDWriteFontFace5>()?;
+        let resource = unsafe { face.GetFontResource()? };
+        let instance = |weight, simulations| -> Result<IDWriteFontFace3> {
+            let axes = [DWRITE_FONT_AXIS_VALUE {
+                axisTag: DWRITE_FONT_AXIS_TAG_WEIGHT,
+                value: weight,
+            }];
+            let face = unsafe { resource.CreateFontFace(simulations, &axes)? };
+            assert_eq!(unsafe { face.GetSimulations() }, simulations);
+            assert!(super::font_axis_values(&face)?.contains(&axes[0]));
+            Ok(face.cast()?)
+        };
+        let oblique = instance(550., DWRITE_FONT_SIMULATIONS_OBLIQUE)?;
+        let upright = instance(550., DWRITE_FONT_SIMULATIONS_NONE)?;
+        let heavier = instance(650., DWRITE_FONT_SIMULATIONS_NONE)?;
+        let mut resolve =
+            |face| state.shaped_font_id(&system.components, face, &system.components.locale);
+        let oblique_id = resolve(&oblique)?;
+        let upright_id = resolve(&upright)?;
+        let heavier_id = resolve(&heavier)?;
+        assert_ne!(upright_id, oblique_id);
+        assert_ne!(upright_id, heavier_id);
+        assert_ne!(heavier_id, oblique_id);
+        assert_eq!(resolve(&oblique)?, oblique_id);
+        assert_eq!(resolve(&upright)?, upright_id);
+        assert_eq!(resolve(&heavier)?, heavier_id);
+        let count = state.fonts.len();
+        let alias_factory: IDWriteFactory6 =
+            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED)? };
+        let alias: IDWriteFontFace3 = unsafe {
+            let reference = upright.GetFontFaceReference()?;
+            let axes = super::font_axis_values(&upright.cast::<IDWriteFontFace5>()?)?;
+            let recreated = alias_factory
+                .CreateFontFaceReference(
+                    &reference.GetFontFile()?,
+                    reference.GetFontFaceIndex(),
+                    DWRITE_FONT_SIMULATIONS_NONE,
+                    &axes,
+                )?
+                .CreateFontFace()?;
+            assert_eq!(super::font_axis_values(&recreated)?, axes);
+            recreated.cast()?
+        };
+        assert_ne!(
+            upright.cast::<windows::core::IUnknown>()?,
+            alias.cast::<windows::core::IUnknown>()?
+        );
+        assert_eq!(
+            state.shaped_font_id(&system.components, &alias, &system.components.locale)?,
+            upright_id
+        );
+        assert_eq!(state.fonts.len(), count);
+        Ok(())
     }
 
     #[test]

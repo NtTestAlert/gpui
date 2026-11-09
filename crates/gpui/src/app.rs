@@ -4,7 +4,6 @@ use std::{
     cell::{BorrowMutError, Cell, Ref, RefCell, RefMut},
     ffi::OsString,
     marker::PhantomData,
-    mem,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
@@ -1207,6 +1206,21 @@ impl App {
         (result, entities_accessed_in_callback)
     }
 
+    /// Returns the number of entity keys in the render dependency index.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn tracked_render_entity_count(&self) -> usize {
+        self.window_invalidators_by_entity.len()
+    }
+
+    fn remove_window_render_dependency(&mut self, entity: EntityId, window: WindowId) {
+        if let Some(windows) = self.window_invalidators_by_entity.get_mut(&entity) {
+            windows.remove(&window);
+            if windows.is_empty() {
+                self.window_invalidators_by_entity.remove(&entity);
+            }
+        }
+    }
+
     pub(crate) fn record_entities_accessed(
         &mut self,
         window_handle: AnyWindowHandle,
@@ -1215,20 +1229,18 @@ impl App {
     ) {
         let mut tracked_entities =
             std::mem::take(self.tracked_entities.entry(window_handle.id).or_default());
-        for entity in tracked_entities.iter() {
-            self.window_invalidators_by_entity
-                .entry(*entity)
-                .and_modify(|windows| {
-                    windows.remove(&window_handle.id);
-                });
+        for &entity in tracked_entities.difference(entities) {
+            self.remove_window_render_dependency(entity, window_handle.id);
         }
-        for entity in entities.iter() {
-            self.window_invalidators_by_entity
-                .entry(*entity)
-                .or_default()
-                .insert(window_handle.id, invalidator.clone());
+        for &entity in entities {
+            if !tracked_entities.contains(&entity) {
+                self.window_invalidators_by_entity
+                    .entry(entity)
+                    .or_default()
+                    .insert(window_handle.id, invalidator.clone());
+            }
             self.current_window_by_entity
-                .insert(*entity, window_handle.id);
+                .insert(entity, window_handle.id);
         }
         tracked_entities.clear();
         tracked_entities.extend(entities.iter().copied());
@@ -2788,24 +2800,11 @@ impl App {
 
     /// Tell GPUI that an entity has changed and observers of it should be notified.
     pub fn notify(&mut self, entity_id: EntityId) {
-        let window_invalidators = mem::take(
-            self.window_invalidators_by_entity
-                .entry(entity_id)
-                .or_default(),
-        );
-
-        // `window_invalidators_by_entity` is monotonic, so an entry alone
-        // doesn't mean the window is currently rendering the entity. Filter
-        // through `tracked_entities` to keep invalidation tight to windows
-        // that actually display this entity right now.
-        let live_invalidators: SmallVec<[WindowInvalidator; 2]> = window_invalidators
-            .iter()
-            .filter(|(window_id, _)| {
-                self.tracked_entities
-                    .get(window_id)
-                    .is_some_and(|set| set.contains(&entity_id))
-            })
-            .map(|(_, invalidator)| invalidator.clone())
+        let live_invalidators: SmallVec<[WindowInvalidator; 2]> = self
+            .window_invalidators_by_entity
+            .get(&entity_id)
+            .into_iter()
+            .flat_map(|windows| windows.values().cloned())
             .collect();
 
         if live_invalidators.is_empty() {
@@ -2818,9 +2817,6 @@ impl App {
                 invalidator.invalidate_view(entity_id, self);
             }
         }
-
-        self.window_invalidators_by_entity
-            .insert(entity_id, window_invalidators);
     }
 
     /// Returns the name for this [`App`].
@@ -2899,11 +2895,7 @@ impl App {
                     cx.windows.remove(window_id);
                     if let Some(tracked) = cx.tracked_entities.remove(&window_id) {
                         for entity_id in tracked {
-                            if let Some(windows) =
-                                cx.window_invalidators_by_entity.get_mut(&entity_id)
-                            {
-                                windows.remove(&window_id);
-                            }
+                            cx.remove_window_render_dependency(entity_id, window_id);
                             if cx.current_window_by_entity.get(&entity_id) == Some(&window_id) {
                                 cx.current_window_by_entity.remove(&entity_id);
                             }

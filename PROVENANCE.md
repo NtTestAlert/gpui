@@ -23,3 +23,12 @@ For local work use `[patch.crates-io]` path overrides for `gpui-pre` and
 `gpui-pre-windows`. For reproducible distribution commit reviewed changes to a
 reachable snapshot fork and replace both overrides with the same immutable Git
 revision. Keep package names, library names and versions unchanged.
+
+## Element lifetime
+
+During a window draw, GPUI allocates erased elements (`AnyElement`) in the
+active frame arena. Clearing that arena runs their destructors together.
+Outside a draw, this fork stores each erased element in an owning box. Dropping
+a prebuilt tree releases its children and captured values, including when the
+tree becomes a child of a frame-allocated element. The published snapshot put
+off-frame elements in a thread-local arena that retained them until thread exit.

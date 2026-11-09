@@ -587,7 +587,12 @@ where
 }
 
 /// A dynamically typed element that can be used to store any element type.
-pub struct AnyElement(ArenaBox<dyn ElementObject>);
+pub struct AnyElement(ElementStorage);
+
+enum ElementStorage {
+    Frame(ArenaBox<dyn ElementObject>),
+    Owned(Box<dyn ElementObject>),
+}
 
 impl AnyElement {
     pub(crate) fn new<E>(element: E) -> Self
@@ -595,20 +600,33 @@ impl AnyElement {
         E: 'static + Element,
         E::RequestLayoutState: Any,
     {
-        let element = with_element_arena(|arena| arena.alloc(|| Drawable::new(element)))
-            .map(|element| element as &mut dyn ElementObject);
-        AnyElement(element)
+        AnyElement(with_element_arena(|arena| match arena {
+            Some(arena) => ElementStorage::Frame(
+                arena
+                    .alloc(|| Drawable::new(element))
+                    .map(|element| element as &mut dyn ElementObject),
+            ),
+            // Prebuilt elements may survive several frames, or be discarded without drawing.
+            None => ElementStorage::Owned(Box::new(Drawable::new(element))),
+        }))
+    }
+
+    fn object(&mut self) -> &mut dyn ElementObject {
+        match &mut self.0 {
+            ElementStorage::Frame(element) => &mut **element,
+            ElementStorage::Owned(element) => element.as_mut(),
+        }
     }
 
     /// Attempt to downcast a reference to the boxed element to a specific type.
     pub fn downcast_mut<T: 'static>(&mut self) -> Option<&mut T> {
-        self.0.inner_element().downcast_mut::<T>()
+        self.object().inner_element().downcast_mut::<T>()
     }
 
     /// Request the layout ID of the element stored in this `AnyElement`.
     /// Used for laying out child elements in a parent element.
     pub fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
-        self.0.request_layout(window, cx)
+        self.object().request_layout(window, cx)
     }
 
     /// Prepares the element to be painted by storing its bounds, giving it a chance to draw hitboxes and
@@ -616,7 +634,7 @@ impl AnyElement {
     pub fn prepaint(&mut self, window: &mut Window, cx: &mut App) -> Option<FocusHandle> {
         let focus_assigned = window.next_frame.focus.is_some();
 
-        self.0.prepaint(window, cx);
+        self.object().prepaint(window, cx);
 
         if !focus_assigned && let Some(focus_id) = window.next_frame.focus {
             return FocusHandle::for_id(focus_id, &cx.focus_handles);
@@ -627,7 +645,7 @@ impl AnyElement {
 
     /// Paints the element stored in this `AnyElement`.
     pub fn paint(&mut self, window: &mut Window, cx: &mut App) {
-        self.0.paint(window, cx);
+        self.object().paint(window, cx);
     }
 
     /// Performs layout for this element within the given available space and returns its size.
@@ -637,7 +655,7 @@ impl AnyElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Size<Pixels> {
-        self.0.layout_as_root(available_space, window, cx)
+        self.object().layout_as_root(available_space, window, cx)
     }
 
     /// Prepaints this element at the given absolute origin.
