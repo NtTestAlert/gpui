@@ -2,8 +2,9 @@
 
 This standalone workspace imports the exact registry source archives below.
 The crate directories retain their normalized published `Cargo.toml`, original
-`Cargo.toml.orig`, licensing, notices and source without modification. The root
-workspace and local core override are integration scaffolding added downstream.
+`Cargo.toml.orig`, licensing and notices. The root workspace and local core
+override are integration scaffolding added downstream. The source has the
+downstream changes described below.
 
 Upstream Zed revision: `93d745668805029476e6d7fbb19652116fed51de`.
 The packaging script is Longbridge GPUI Kit's `script/bump-gpui.ts`; published
@@ -24,3 +25,12 @@ For local work use `[patch.crates-io]` path overrides for `gpui-pre` and
 `gpui-pre-windows`. For reproducible distribution commit reviewed changes to a
 reachable snapshot fork and replace both overrides with the same immutable Git
 revision. Keep package names, library names and versions unchanged.
+
+## Downstream fixes
+
+- Prune empty render-dependency entries while preserving observers and
+  multi-window invalidation.
+- Own elements created outside a frame so their captured values are dropped;
+  keep arena allocation for elements constructed during a frame.
+- Retain the exact DirectWrite shaped face, including simulated styles and
+  variable axes, and reuse stable rasterization IDs for equivalent faces.
